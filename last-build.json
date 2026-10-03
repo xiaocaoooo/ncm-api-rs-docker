@@ -1,5 +1,5 @@
 {
-  "upstream_sha": "",
+  "upstream_sha": "133b65bfe482e41ebccf018870d3fce07bf58eb3",
   "image": "xiaocaoooo/ncm-api-rs",
-  "version": ""
+  "version": "0.1.0"
 }
