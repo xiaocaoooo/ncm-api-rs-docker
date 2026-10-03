@@ -1,0 +1,132 @@
+name: Publish Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream-ref:
+        description: '上游分支 / 标签（构建 SPlayer-Dev/ncm-api-rs 的 ref）'
+        required: false
+        default: 'main'
+      image-name:
+        description: 'Docker Hub 镜像名（user/repo）'
+        required: false
+        default: 'xiaocaoooo/ncm-api-rs'
+      force:
+        description: '无新提交时强制重建'
+        required: false
+        default: 'false'
+  schedule:
+    # 每 30 分钟检查一次上游是否有新提交，有则构建推送
+    - cron: '*/30 * * * *'
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: SPlayer-Dev/ncm-api-rs
+  UPSTREAM_URL: https://github.com/SPlayer-Dev/ncm-api-rs.git
+
+jobs:
+  check-update:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      latest_sha: ${{ steps.decide.outputs.latest_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # 本 job 不需要 push
+      - name: Resolve upstream ref
+        id: resolve
+        run: |
+          REF="${{ inputs.upstream-ref || 'main' }}"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+      - name: Fetch upstream latest commit
+        id: decide
+        run: |
+          set -euo pipefail
+          REF="${{ steps.resolve.outputs.ref }}"
+          LATEST="$(git ls-remote "$UPSTREAM_URL" "refs/heads/$REF" | awk '{print $1}')"
+          if [ -z "$LATEST" ]; then
+            LATEST="$(git ls-remote "$UPSTREAM_URL" "refs/tags/$REF" | awk '{print $1}')"
+          fi
+          if [ -z "$LATEST" ]; then
+            LATEST="$(git ls-remote "$UPSTREAM_URL" "refs/tags/v$REF" | awk '{print $1}')"
+          fi
+          if [ -z "$LATEST" ]; then
+            echo "::error::无法解析上游 ref: $REF"
+            exit 1
+          fi
+          LAST=""
+          if [ -f last-build.json ]; then
+            LAST="$(jq -r '.upstream_sha // ""' last-build.json)"
+          fi
+          FORCE="${{ inputs.force || 'false' }}"
+          echo "latest=$LATEST last=$LAST force=$FORCE"
+          if [ "$LATEST" != "$LAST" ] || [ "$FORCE" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "latest_sha=$LATEST" >> "$GITHUB_OUTPUT"
+
+  build-push:
+    runs-on: ubuntu-latest
+    needs: check-update
+    if: github.event_name == 'workflow_dispatch' || needs.check-update.outputs.should_build == 'true'
+    steps:
+      - name: Checkout this repo (Dockerfile / last-build.json)
+        uses: actions/checkout@v4
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ inputs.upstream-ref || 'main' }}
+          path: src
+      - name: Place Dockerfile into source context
+        run: cp Dockerfile src/Dockerfile
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB_PASSWORD }}
+      - name: Resolve version and short sha
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 '^version = ' src/Cargo.toml | cut -d'"' -f2)"
+          SHORT="$(git -C src rev-parse --short HEAD)"
+          IMAGE="${{ inputs.image-name || 'xiaocaoooo/ncm-api-rs' }}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "image_name=$IMAGE" >> "$GITHUB_ENV"
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src
+          file: ./src/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.image_name }}:latest
+            ${{ env.image_name }}:v${{ steps.meta.outputs.version }}
+            ${{ env.image_name }}:sha-${{ steps.meta.outputs.short }}
+      - name: Update last-build state
+        run: |
+          set -euo pipefail
+          LATEST_SHA="${{ needs.check-update.outputs.latest_sha }}"
+          jq -n \
+            --arg s "$LATEST_SHA" \
+            --arg i "${{ env.image_name }}" \
+            --arg v "${{ steps.meta.outputs.version }}" \
+            '{upstream_sha: $s, image: $i, version: $v}' > last-build.json
+          if ! git diff --quiet -- last-build.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add last-build.json
+            git commit -m "ci: record last built upstream sha"
+            git push
+          fi
