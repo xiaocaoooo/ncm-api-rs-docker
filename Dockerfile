@@ -4,7 +4,7 @@
 
 FROM rust:slim AS builder
 ARG TARGETARCH
-RUN MUA="$( [ "$TARGETARCH" = "arm64" ] && echo aarch64 || echo "$TARGETARCH" )" \
+RUN MUA="$( case "$TARGETARCH" in arm64) echo aarch64 ;; amd64) echo x86_64 ;; *) echo "$TARGETARCH" ;; esac )" \
     && MU="${MUA}-unknown-linux-musl" \
     && MUGCC="${MUA}-linux-musl-gcc" \
     && apt-get update \
